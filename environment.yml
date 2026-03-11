@@ -1,0 +1,19 @@
+name: COMP6228-IRP
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - seaborn
+  - h5py
+  - tqdm
+  - jupyter
+  - ipykernel
+  - pip
+  - pip:
+    - tensorly
+    - stonesoup

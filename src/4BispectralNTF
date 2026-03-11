@@ -1,0 +1,261 @@
+"""
+Step 4: Bispectral Tensor Construction + NTF Decomposition
+===========================================================
+We now:
+  1. Compute the bispectrum for EVERY channel → tensor B(f1, f2, channel)
+  2. Factorise B using Nonnegative Tensor Factorisation (NTF) with CP decomposition
+  3. Interpret the factors:
+       - Frequency factors a_k, b_k: what coupling patterns exist
+       - Spatial factor c_k: WHERE along the cable each source is active
+
+This is the core of the project. Everything before this was preparation.
+
+NTF solves:
+  B ≈ sum_k  a_k ⊗ b_k ⊗ c_k
+  subject to a_k, b_k, c_k >= 0
+
+We use tensorly's CP decomposition with non-negativity constraints.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import tensorly as tl
+from tensorly.decomposition import non_negative_parafac
+from scipy.signal import windows
+from tqdm import tqdm
+
+# ── Re-generate synthetic data ────────────────────────────────────────────────
+FS          = 200
+DURATION    = 30
+N_CHANNELS  = 100
+DX          = 1.275
+VESSEL_FREQ = 30.0
+SNR_DB      = 5
+
+N_SAMPLES       = int(FS * DURATION)
+T               = np.linspace(0, DURATION, N_SAMPLES)
+X_pos           = np.arange(N_CHANNELS) * DX
+VESSEL_SPEED    = 3.0
+VESSEL_START    = 10 * DX
+vessel_position = VESSEL_START + VESSEL_SPEED * T
+
+np.random.seed(42)
+data = np.zeros((N_CHANNELS, N_SAMPLES))
+for c in range(N_CHANNELS):
+    channel_pos   = X_pos[c]
+    distance      = np.abs(channel_pos - vessel_position)
+    amplitude     = np.clip(1.0 / (distance + 1e-3), 0, 1.0)
+    vessel_signal = amplitude * np.sin(2 * np.pi * VESSEL_FREQ * T)
+    vessel_signal += 0.4 * amplitude * np.sin(2 * np.pi * 2 * VESSEL_FREQ * T)
+    data[c, :]    = vessel_signal
+
+signal_power = np.mean(data ** 2)
+noise_power  = signal_power / (10 ** (SNR_DB / 10))
+noise        = np.random.normal(0, np.sqrt(noise_power), data.shape)
+data_noisy   = data + noise
+
+# ── Bispectral Tensor Parameters ──────────────────────────────────────────────
+WINDOW_SIZE = 256
+OVERLAP     = 128
+N_FREQ      = WINDOW_SIZE // 2 + 1
+freqs       = np.fft.rfftfreq(WINDOW_SIZE, d=1.0 / FS)
+
+# ── Vectorised Bispectrum (fast) ──────────────────────────────────────────────
+def compute_bispectrum_fast(signal, window_size=256, overlap=128):
+    """
+    Vectorised bispectrum computation — no Python loops over frequencies.
+
+    Instead of looping over every (f1, f2) pair, we:
+    1. Compute X(f) for each frame (vectorised FFT)
+    2. Compute the outer product X(f1) * X(f2) for all pairs at once
+    3. Index into conj(X(f3)) using f3 = f1 + f2
+
+    This is ~100x faster than the nested loop in Step 3.
+    """
+    step     = window_size - overlap
+    n_frames = (len(signal) - window_size) // step + 1
+    n_freq   = window_size // 2 + 1
+    win      = windows.hann(window_size)
+
+    B = np.zeros((n_freq, n_freq), dtype=complex)
+
+    for i in range(n_frames):
+        start = i * step
+        frame = signal[start: start + window_size] * win
+        X     = np.fft.rfft(frame)   # shape: (n_freq,)
+
+        # Outer product: X_outer[f1, f2] = X[f1] * X[f2]
+        X_outer = np.outer(X, X)     # shape: (n_freq, n_freq)
+
+        # For each (f1, f2), we need conj(X[f1+f2])
+        # Build index matrix: sum_idx[f1, f2] = f1 + f2
+        f_idx   = np.arange(n_freq)
+        sum_idx = f_idx[:, None] + f_idx[None, :]   # shape: (n_freq, n_freq)
+
+        # Mask: only keep pairs where f1+f2 < n_freq (principal domain)
+        valid   = sum_idx < n_freq
+
+        # Clip invalid indices to 0 (they'll be masked out anyway)
+        sum_idx_clipped = np.where(valid, sum_idx, 0)
+
+        # Gather conj(X[f1+f2]) for all valid pairs
+        X_conj_f3 = np.conj(X[sum_idx_clipped])
+
+        # Accumulate: B[f1,f2] += X[f1] * X[f2] * conj(X[f1+f2])
+        B += np.where(valid, X_outer * X_conj_f3, 0)
+
+    B /= n_frames
+    return np.abs(B)   # return magnitude — NTF requires nonnegative input
+
+
+# ── Build the Full Bispectral Tensor B(f1, f2, channel) ──────────────────────
+print(f"Building bispectral tensor: ({N_FREQ} x {N_FREQ} x {N_CHANNELS})...")
+print(f"This may take ~30 seconds...")
+
+tensor = np.zeros((N_FREQ, N_FREQ, N_CHANNELS), dtype=np.float32)
+
+for c in tqdm(range(N_CHANNELS), desc="Channels"):
+    tensor[:, :, c] = compute_bispectrum_fast(
+        data_noisy[c, :], WINDOW_SIZE, OVERLAP
+    )
+
+print(f"Tensor shape: {tensor.shape}")
+print(f"Tensor size in memory: {tensor.nbytes / 1e6:.1f} MB")
+
+# ── Restrict to principal domain only ────────────────────────────────────────
+# Zero out entries where f1 > f2 or f1+f2 >= N_FREQ
+# This avoids redundant information and keeps the tensor sparse
+f_idx   = np.arange(N_FREQ)
+sum_idx = f_idx[:, None] + f_idx[None, :]
+mask_2d = (f_idx[:, None] <= f_idx[None, :]) & (sum_idx < N_FREQ)
+tensor  = tensor * mask_2d[:, :, np.newaxis]
+
+# ── NTF: Nonnegative CP Decomposition ────────────────────────────────────────
+# We decompose B ≈ sum_k a_k ⊗ b_k ⊗ c_k
+# Rank R = number of components to extract
+# Start small — in real data you'd use SON to auto-determine this
+
+R = 4   # we know we have 1 vessel + harmonics + noise, so 4 is reasonable
+
+print(f"\nRunning NTF with rank R={R}...")
+tl.set_backend('numpy')
+
+# non_negative_parafac returns a CPTensor: (weights, [factor_matrices])
+cp_tensor = non_negative_parafac(
+    tl.tensor(tensor),
+    rank=R,
+    n_iter_max=100,
+    init='random',
+    random_state=42,
+    verbose=False
+)
+
+factors  = cp_tensor.factors          # list of 3 matrices
+
+# Factor matrices — each column is one component
+A_raw = factors[0]   # shape: (N_FREQ, R) — frequency mode 1
+B_raw = factors[1]   # shape: (N_FREQ, R) — frequency mode 2
+C_raw = factors[2]   # shape: (N_CHANNELS, R) — spatial mode
+
+# ── Recover meaningful weights ────────────────────────────────────────────────
+# Tensorly absorbs weights into factors. We recover them by computing the
+# norm of each component's contribution and normalising the factors.
+# Weight_k = ||a_k|| * ||b_k|| * ||c_k||  (product of column norms)
+weights = np.zeros(R)
+A = np.zeros_like(A_raw)
+B = np.zeros_like(B_raw)
+C = np.zeros_like(C_raw)
+
+for k in range(R):
+    norm_a = np.linalg.norm(A_raw[:, k]) + 1e-12
+    norm_b = np.linalg.norm(B_raw[:, k]) + 1e-12
+    norm_c = np.linalg.norm(C_raw[:, k]) + 1e-12
+    weights[k] = norm_a * norm_b * norm_c
+    A[:, k] = A_raw[:, k] / norm_a
+    B[:, k] = B_raw[:, k] / norm_b
+    C[:, k] = C_raw[:, k] / norm_c
+
+print("NTF complete.")
+print(f"  A (freq mode 1): {A.shape}")
+print(f"  B (freq mode 2): {B.shape}")
+print(f"  C (spatial mode): {C.shape}")
+print(f"  Weights: {weights.round(2)}")
+
+# ── Reconstruction error ──────────────────────────────────────────────────────
+tensor_reconstructed = tl.cp_to_tensor(cp_tensor)
+rel_error = np.linalg.norm(tensor - tensor_reconstructed) / np.linalg.norm(tensor)
+print(f"  Relative reconstruction error: {rel_error:.4f}")
+
+# ── Plot Results ──────────────────────────────────────────────────────────────
+fig = plt.figure(figsize=(18, 12))
+gs  = gridspec.GridSpec(3, R, figure=fig, hspace=0.55, wspace=0.35)
+
+# Sort components by weight (largest first)
+order = np.argsort(-weights)
+
+for col, k in enumerate(order):
+    component_label = f"Component {col+1}\n(weight={weights[k]:.2f})"
+
+    # Row 0: Bispectral signature — outer product of frequency factors
+    # This shows what coupling pattern this component captures
+    ax_bispec = fig.add_subplot(gs[0, col])
+    bispec_k  = np.outer(A[:, k], B[:, k])
+    # Normalise colormap per component so the peak is always visible
+    vmax = np.percentile(bispec_k, 99)   # robust max — ignores outliers
+    vmin = 0
+    ax_bispec.imshow(
+        bispec_k,
+        origin='lower', aspect='auto',
+        extent=[freqs[0], freqs[-1], freqs[0], freqs[-1]],
+        cmap='hot', vmin=vmin, vmax=vmax
+    )
+    # Mark where 30Hz coupling would appear
+    ax_bispec.axvline(30, color='cyan', linestyle='--', linewidth=0.8, alpha=0.7)
+    ax_bispec.axhline(30, color='cyan', linestyle='--', linewidth=0.8, alpha=0.7)
+    ax_bispec.set_xlabel('f1 (Hz)', fontsize=8)
+    ax_bispec.set_ylabel('f2 (Hz)', fontsize=8)
+    ax_bispec.set_title(f'{component_label}\nBispectral signature', fontsize=8)
+    ax_bispec.set_xlim(0, FS/2)
+    ax_bispec.set_ylim(0, FS/2)
+
+    # Row 1: Frequency factor — which frequencies does this component use?
+    ax_freq = fig.add_subplot(gs[1, col])
+    ax_freq.plot(freqs, A[:, k], label='Factor A', linewidth=1.0)
+    ax_freq.plot(freqs, B[:, k], label='Factor B', linewidth=1.0, linestyle='--')
+    ax_freq.axvline(30, color='red',    linestyle=':', linewidth=0.8)
+    ax_freq.axvline(60, color='orange', linestyle=':', linewidth=0.8)
+    ax_freq.set_xlabel('Frequency (Hz)', fontsize=8)
+    ax_freq.set_ylabel('Factor value', fontsize=8)
+    ax_freq.set_title('Frequency factors', fontsize=8)
+    ax_freq.legend(fontsize=7)
+    ax_freq.set_xlim(0, FS/2)
+    ax_freq.grid(True, alpha=0.3)
+
+    # Row 2: Spatial factor — WHERE along the cable is this component active?
+    ax_space = fig.add_subplot(gs[2, col])
+    ax_space.plot(X_pos, C[:, k], linewidth=1.2, color='green')
+    ax_space.set_xlabel('Cable position (m)', fontsize=8)
+    ax_space.set_ylabel('Activation', fontsize=8)
+    ax_space.set_title('Spatial signature\n(where on cable?)', fontsize=8)
+    ax_space.grid(True, alpha=0.3)
+
+    # Mark the expected vessel track region
+    vessel_start_m = VESSEL_START
+    vessel_end_m   = VESSEL_START + VESSEL_SPEED * DURATION
+    ax_space.axvspan(
+        max(vessel_start_m, X_pos[0]),
+        min(vessel_end_m,   X_pos[-1]),
+        alpha=0.15, color='red', label='Vessel region'
+    )
+    ax_space.legend(fontsize=7)
+
+plt.suptitle('Step 4: NTF Decomposition of Bispectral Tensor\nRows: Bispectral signature | Frequency factors | Spatial activation',
+             fontsize=11, fontweight='bold')
+plt.savefig('COMP6228-IRP/img/04_ntf_decomposition.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print("\nHow to read these results:")
+print("  - A component with peaks near 30Hz in its frequency factors")
+print("    AND a spatially localised signature = vessel detected")
+print("  - A component with diffuse frequency content = noise/background")
